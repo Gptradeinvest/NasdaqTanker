@@ -6,44 +6,26 @@ import matplotlib.ticker as mtick
 from dataclasses import dataclass
 from typing import Tuple, Dict, Optional
 
-# ==========================================
-# 0. CONFIGURATION GRAPHIQUE (ROBUSTE)
-# ==========================================
-# Sélectionne le meilleur style "Pro" disponible selon votre version de Matplotlib
 styles_to_try = ['seaborn-v0_8-darkgrid', 'seaborn-darkgrid', 'bmh', 'ggplot']
 for style in styles_to_try:
     if style in plt.style.available:
         plt.style.use(style)
         break
 
-# ==========================================
-# 1. CONFIGURATION & DATA CLASSES
-# ==========================================
-
 @dataclass
 class StrategyConfig:
-    """Configuration des paramètres de la stratégie (Immutable)."""
     ticker: str = "QQQ"
     start_date: str = "2005-01-01"
     end_date: str = pd.Timestamp.today().strftime('%Y-%m-%d')
-    risk_free_rate: float = 0.035  # Taux sans risque moyen (3.5%)
-    vol_target: float = 0.15       # Cible de volatilité (15%)
-    es_lookback: int = 21          # Fenêtre pour l'Expected Shortfall
-    es_guard_thresh: float = 0.15  # Seuil de déclenchement du Guard
-    ma_short: int = 40             # Moyenne mobile courte
-    ma_long: int = 136             # Moyenne mobile longue
-    leverage_cap: float = 1.80     # Levier maximum autorisé
-
-# ==========================================
-# 2. MOTEUR DE STRATÉGIE (CLASS)
-# ==========================================
+    risk_free_rate: float = 0.035
+    vol_target: float = 0.15
+    es_lookback: int = 21
+    es_guard_thresh: float = 0.15
+    ma_short: int = 40
+    ma_long: int = 136
+    leverage_cap: float = 1.80
 
 class GoldilocksStrategy:
-    """
-    Moteur de backtesting Corporate Finance :
-    Volatility Targeting + Trend Filter + ES Risk Guard.
-    """
-
     def __init__(self, config: StrategyConfig):
         self.cfg = config
         self.data: Optional[pd.DataFrame] = None
@@ -51,7 +33,6 @@ class GoldilocksStrategy:
         self.metrics: Dict = {}
 
     def load_data(self) -> None:
-        """Récupération et nettoyage des données de marché via Yahoo Finance."""
         print(f"INFO: Chargement des données pour {self.cfg.ticker} ({self.cfg.start_date} - {self.cfg.end_date})...")
         
         try:
@@ -66,14 +47,12 @@ class GoldilocksStrategy:
         except Exception as e:
             raise ConnectionError(f"Erreur de connexion Yahoo Finance: {e}")
 
-        # Gestion robuste des MultiIndex (changement récent API yfinance)
         if isinstance(raw_data.columns, pd.MultiIndex):
             try:
                 raw_data.columns = raw_data.columns.get_level_values(0)
             except IndexError:
-                pass # Structure déjà plate
+                pass
 
-        # Sélection et nettoyage strict
         self.data = raw_data[['Open', 'High', 'Low', 'Close']].dropna().copy()
         
         if self.data.empty:
@@ -82,41 +61,29 @@ class GoldilocksStrategy:
         print(f"SUCCÈS: {len(self.data)} jours de trading chargés.")
 
     @staticmethod
-    def _calculate_rolling_es(returns: np.ndarray, window: int, confidence: float = 0.95) -> np.ndarray:
-        """
-        Calcul vectorisé de l'Expected Shortfall (CVaR) glissant.
-        Optimisé pour la performance (similaire numpy stride tricks).
-        """
-        if len(returns) < window:
-            return np.zeros_like(returns)
+    def _calculate_rolling_es(returns: pd.Series, window: int, confidence: float = 0.95) -> pd.Series:
+        """Expected Shortfall rolling strict (point-in-time uniquement)."""
+        cutoff = int((1 - confidence) * window)
         
-        # Création d'une vue fenêtrée du tableau (mémoire efficace)
-        shape = (returns.size - window + 1, window)
-        strides = (returns.strides[0], returns.strides[0])
-        windows = np.lib.stride_tricks.as_strided(returns, shape=shape, strides=strides)
+        def compute_es(window_data):
+            if len(window_data) < window:
+                return np.nan
+            sorted_rets = np.sort(window_data)
+            tail = sorted_rets[:max(1, cutoff)]
+            return -np.mean(tail) if len(tail) > 0 else 0
         
-        # Seuil de coupure pour la queue de distribution
-        cutoff_idx = int((1 - confidence) * window)
-        
-        es_values = []
-        for w in windows:
-            sorted_w = np.sort(w)
-            # On prend les pires rendements (tail)
-            tail = sorted_w[:max(1, cutoff_idx)]
-            val = -np.mean(tail) if len(tail) > 0 else 0
-            es_values.append(val)
-            
-        # Padding initial pour aligner avec l'index original
-        return np.concatenate((np.zeros(window - 1), np.array(es_values)))
+        return returns.rolling(window).apply(compute_es, raw=True)
 
     def run_backtest(self) -> None:
-        """Exécution du pipeline de calcul des signaux et de la performance."""
         if self.data is None:
             self.load_data()
 
         df = self.data.copy()
         
-        # --- A. Volatilité (ATR Based) ---
+        # Rendements J
+        rets = df['Close'].pct_change()
+        
+        # Volatilité (ATR) - Calcul sur données J, utilisation J+1
         prev_close = df['Close'].shift(1)
         high_low = df['High'] - df['Low']
         high_close = (df['High'] - prev_close).abs()
@@ -124,83 +91,62 @@ class GoldilocksStrategy:
         
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         atr = tr.rolling(20).mean()
-        
-        # Estimation Volatilité Annualisée
         vol_est = (atr / df['Close'].replace(0, np.nan)) * np.sqrt(252)
-        vol_est = vol_est.fillna(0.15) # Fallback conservateur
-
-        # --- B. Expected Shortfall (Risk Guard) ---
-        rets = df['Close'].pct_change().fillna(0)
-        es_vals = self._calculate_rolling_es(rets.values, self.cfg.es_lookback) * np.sqrt(21) # Mensualisé approx
+        vol_est = vol_est.fillna(0.15)
+        vol_est_lagged = vol_est.shift(1)  # Connaissance J-1 pour décision J
         
-        # Signal Guard (1 = Invest, 0 = Cash)
-        # Si ES > Threshold, risque de krach détecté -> On coupe.
-        sig_guard = np.where(es_vals > self.cfg.es_guard_thresh, 0, 1)
-
-        # --- C. Trend Following (MA Crossover) ---
+        # Expected Shortfall - Calcul sur données J, utilisation J+1
+        es_vals = self._calculate_rolling_es(rets, self.cfg.es_lookback) * np.sqrt(21)
+        es_vals_lagged = es_vals.shift(1)  # Connaissance J-1 pour décision J
+        sig_guard = (es_vals_lagged <= self.cfg.es_guard_thresh).astype(int)
+        
+        # Trend Following - Calcul sur Close J, utilisation J+1
         ma_s = df['Close'].rolling(self.cfg.ma_short).mean()
         ma_l = df['Close'].rolling(self.cfg.ma_long).mean()
-        sig_trend = np.where(ma_s > ma_l, 1, 0)
-
-        # --- D. Allocation & Levier ---
-        # Target Weight = Vol Target / Realized Vol
-        raw_weight = (self.cfg.vol_target / vol_est)
-        # Cap du levier (Risk Management)
+        ma_s_lagged = ma_s.shift(1)  # Position des MAs connue à J-1
+        ma_l_lagged = ma_l.shift(1)
+        sig_trend = (ma_s_lagged > ma_l_lagged).astype(int)
+        
+        # Allocation - Basée sur vol estimée J-1
+        raw_weight = (self.cfg.vol_target / vol_est_lagged)
         capped_weight = raw_weight.clip(upper=self.cfg.leverage_cap)
         
-        # Application des filtres (Guard & Trend) et Lag J+1 (Trading en Open/Close next day)
-        final_weight = pd.Series(
-            (capped_weight * sig_guard * sig_trend).shift(1), 
-            index=df.index
-        ).fillna(0)
-
-        # --- E. Attribution de Performance ---
-        # Rendement Stratégie = (Poids * Market) + ((1 - Poids) * Taux Sans Risque)
+        # Poids final pour trading J (basé sur infos J-1)
+        final_weight = (capped_weight * sig_guard * sig_trend).fillna(0)
+        
+        # Performance - Rendement J appliqué avec poids décidé sur infos J-1
         daily_rfr = self.cfg.risk_free_rate / 252
         strat_ret = (final_weight * rets) + ((1 - final_weight) * daily_rfr)
 
-        # Stockage des résultats
         self.results = pd.DataFrame({
             'Market_Rets': rets,
             'Strat_Rets': strat_ret,
             'Eq_Curve': (1 + strat_ret).cumprod() * 100,
             'Benchmark': (1 + rets).cumprod() * 100,
             'Weight': final_weight,
-            'Drawdown': np.nan # Placeholder
+            'Drawdown': np.nan
         })
         
-        # Calcul Drawdown
         cum_max = self.results['Eq_Curve'].cummax()
         self.results['Drawdown'] = (self.results['Eq_Curve'] / cum_max) - 1
 
     def compute_metrics(self) -> None:
-        """Calcul des KPIs financiers pour le reporting."""
         if self.results is None:
             return
 
-        r = self.results['Strat_Rets']
+        r = self.results['Strat_Rets'].dropna()
         total_days = len(r)
         years = total_days / 252
         
-        # CAGR
         total_ret = self.results['Eq_Curve'].iloc[-1] / 100
         cagr = (total_ret ** (1 / years)) - 1
-        
-        # Volatilité
         vol = r.std() * np.sqrt(252)
-        
-        # Sharpe (Risk Free Rate ajusté)
         sharpe = (cagr - self.cfg.risk_free_rate) / vol
-        
-        # Max Drawdown
         max_dd = self.results['Drawdown'].min()
         
-        # Sortino (Downside Volatility)
         downside_returns = r[r < 0]
         downside_vol = downside_returns.std() * np.sqrt(252)
         sortino = (cagr - self.cfg.risk_free_rate) / downside_vol if downside_vol > 0 else 0
-        
-        # Calmar Ratio
         calmar = cagr / abs(max_dd) if max_dd != 0 else 0
 
         self.metrics = {
@@ -214,7 +160,6 @@ class GoldilocksStrategy:
         }
 
     def print_tearsheet(self):
-        """Affiche un rapport textuel formaté style 'Terminal Bloomberg'."""
         if not self.metrics:
             self.compute_metrics()
             
@@ -236,14 +181,12 @@ class GoldilocksStrategy:
         print("="*60 + "\n")
 
     def plot_performance(self):
-        """Génération des graphiques professionnels."""
         if self.results is None:
             return
 
         fig = plt.figure(figsize=(14, 12))
         gs = fig.add_gridspec(3, 1, height_ratios=[2, 1, 1])
 
-        # 1. Equity Curve (Log Scale)
         ax1 = fig.add_subplot(gs[0])
         ax1.plot(self.results.index, self.results['Eq_Curve'], label='Stratégie (Goldilocks)', color='#2E86C1', linewidth=1.5)
         ax1.plot(self.results.index, self.results['Benchmark'], label=f'Benchmark ({self.cfg.ticker})', color='#95A5A6', alpha=0.6, linewidth=1)
@@ -252,11 +195,8 @@ class GoldilocksStrategy:
         ax1.set_title(f'Performance Historique ({self.cfg.ticker}) - Échelle Logarithmique', fontweight='bold')
         ax1.legend(loc='upper left')
         ax1.grid(True, which="both", ls="-", alpha=0.2)
-        
-        # Formattage Axe Y
         ax1.yaxis.set_major_formatter(mtick.ScalarFormatter())
 
-        # 2. Underwater Plot (Drawdowns)
         ax2 = fig.add_subplot(gs[1], sharex=ax1)
         ax2.plot(self.results.index, self.results['Drawdown'], color='#C0392B', linewidth=1)
         ax2.fill_between(self.results.index, self.results['Drawdown'], 0, color='#C0392B', alpha=0.15)
@@ -266,7 +206,6 @@ class GoldilocksStrategy:
         ax2.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
         ax2.legend(loc='lower right')
 
-        # 3. Leverage / Exposition
         ax3 = fig.add_subplot(gs[2], sharex=ax1)
         ax3.plot(self.results.index, self.results['Weight'], color='#27AE60', linewidth=1, label='Levier Utilisé')
         ax3.axhline(1.0, color='gray', linestyle=':', linewidth=0.8)
@@ -277,12 +216,7 @@ class GoldilocksStrategy:
         plt.tight_layout()
         plt.show()
 
-# ==========================================
-# 3. EXÉCUTION (MAIN)
-# ==========================================
-
 if __name__ == "__main__":
-    # Initialisation de la configuration
     config = StrategyConfig(
         ticker="QQQ",
         vol_target=0.15,
@@ -291,7 +225,6 @@ if __name__ == "__main__":
         risk_free_rate=0.035
     )
 
-    # Instanciation et exécution
     strategy = GoldilocksStrategy(config)
     
     try:
