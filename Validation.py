@@ -8,18 +8,11 @@ import itertools
 from dataclasses import dataclass
 from typing import Tuple, List, Dict, Optional
 
-# ==========================================
-# 0. CONFIGURATION GRAPHIQUE ROBUSTE
-# ==========================================
 styles_to_try = ['seaborn-v0_8-darkgrid', 'seaborn-darkgrid', 'bmh', 'ggplot']
 for style in styles_to_try:
     if style in plt.style.available:
         plt.style.use(style)
         break
-
-# ==========================================
-# 1. CONFIGURATION (DATACLASSES)
-# ==========================================
 
 @dataclass
 class GlobalConfig:
@@ -44,13 +37,11 @@ class ValidationParams:
     cpcv_groups: int = 6          
     cpcv_test_groups: int = 2     
     purge_days: int = 20          
+    embargo_days: int = 20
     mc_sims: int = 100000         
     proj_years: int = 5           
-    retro_years: int = 5          
-
-# ==========================================
-# 2. LOGIQUE MÉTIER (CORE LOGIC)
-# ==========================================
+    retro_years: int = 5
+    use_sample_weights: bool = True
 
 class StrategyEngine:
     
@@ -72,39 +63,90 @@ class StrategyEngine:
     @classmethod
     def compute_strategy_returns(cls, df: pd.DataFrame, params: StrategyParams, rfr: float) -> pd.Series:
         d = df.copy()
+        rets = d['Close'].pct_change().fillna(0)
         
-        # 1. Volatilité (ATR)
         prev_close = d['Close'].shift(1)
         tr = pd.concat([d['High']-d['Low'], (d['High']-prev_close).abs(), (d['Low']-prev_close).abs()], axis=1).max(axis=1)
         atr = tr.rolling(20).mean()
         vol_annual = (atr / d['Close'].replace(0, np.nan)) * np.sqrt(252)
-        vol_annual = vol_annual.fillna(params.vol_target) 
+        vol_annual = vol_annual.fillna(params.vol_target)
+        vol_annual_lag = vol_annual.shift(1)
 
-        # 2. ES Guard
-        rets = d['Close'].pct_change().fillna(0)
         es_vals = cls.rolling_es_fast(rets.values, params.es_lookback) * np.sqrt(21)
+        es_vals = pd.Series(es_vals, index=d.index)
+        es_vals_lag = es_vals.shift(1)
+        sig_guard = (es_vals_lag <= params.es_guard_thresh).astype(int)
         
-        # 3. Signaux
         ma_s = d['Close'].rolling(params.ma_short).mean()
         ma_l = d['Close'].rolling(params.ma_long).mean()
+        ma_s_lag = ma_s.shift(1)
+        ma_l_lag = ma_l.shift(1)
+        sig_trend = (ma_s_lag > ma_l_lag).astype(int)
         
-        sig_guard = np.where(es_vals > params.es_guard_thresh, 0, 1)
-        sig_trend = np.where(ma_s > ma_l, 1, 0)
-        
-        # 4. Allocation (Lag J+1)
-        target_exp = params.vol_target / vol_annual
+        target_exp = params.vol_target / vol_annual_lag
         w_vol = target_exp.clip(upper=params.leverage)
-        w_final = pd.Series((w_vol * sig_guard * sig_trend).shift(1).values, index=d.index).fillna(0)
+        w_final = (w_vol * sig_guard * sig_trend).fillna(0)
         
-        # 5. Rendement avec Coût du Levier
         daily_rfr = rfr / 252
         strategy_rets = (w_final * rets) + ((1 - w_final) * daily_rfr)
         
         return strategy_rets
 
-# ==========================================
-# 3. MOTEUR DE VALIDATION (QUANT LAB)
-# ==========================================
+class AFMLTools:
+    
+    @staticmethod
+    def compute_sample_weights(returns: pd.Series, window: int = 63) -> pd.Series:
+        """Sample weights basés sur l'unicité temporelle (Prado Ch4)."""
+        idx = returns.index
+        weights = pd.Series(1.0, index=idx)
+        
+        for i in range(len(idx)):
+            t = idx[i]
+            concurrent = idx[(idx >= t - pd.Timedelta(days=window)) & (idx <= t + pd.Timedelta(days=window))]
+            weights.loc[t] = 1.0 / len(concurrent)
+        
+        return weights / weights.sum() * len(weights)
+    
+    @staticmethod
+    def get_train_test_indices(n_groups: int, test_groups: List[int], total_size: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Indices train/test pour un fold CPCV."""
+        group_size = total_size // n_groups
+        test_idx = []
+        
+        for tg in test_groups:
+            start = tg * group_size
+            end = (tg + 1) * group_size if tg < n_groups - 1 else total_size
+            test_idx.extend(range(start, end))
+        
+        train_idx = [i for i in range(total_size) if i not in test_idx]
+        return np.array(train_idx), np.array(test_idx)
+    
+    @staticmethod
+    def apply_purge_embargo(train_idx: np.ndarray, test_idx: np.ndarray, 
+                           purge: int, embargo: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Applique purge avant test et embargo après test."""
+        if len(test_idx) == 0:
+            return train_idx, test_idx
+        
+        test_min, test_max = test_idx.min(), test_idx.max()
+        
+        # Purge: retirer train indices proches avant test
+        purge_zone = range(max(0, test_min - purge), test_min)
+        train_idx = np.array([i for i in train_idx if i not in purge_zone])
+        
+        # Embargo: retirer train indices proches après test
+        embargo_zone = range(test_max + 1, min(test_max + 1 + embargo, train_idx.max() + 1) if len(train_idx) > 0 else test_max + 1)
+        train_idx = np.array([i for i in train_idx if i not in embargo_zone])
+        
+        # Purge début du test aussi
+        if purge > 0 and len(test_idx) > purge:
+            test_idx = test_idx[purge:]
+        
+        # Embargo fin du test
+        if embargo > 0 and len(test_idx) > embargo:
+            test_idx = test_idx[:-embargo]
+        
+        return train_idx, test_idx
 
 class QuantValidator:
     
@@ -141,31 +183,47 @@ class QuantValidator:
         print(f"[OK] WFA Terminé. {len(self.oos_series)} jours générés.")
 
     def run_cpcv(self):
-        print("[INFO] Démarrage CPCV...")
+        print("[INFO] Démarrage CPCV (AFML complet)...")
         full_rets = StrategyEngine.compute_strategy_returns(self.data, self.s_cfg, self.g_cfg.risk_free_rate)
-        groups = np.array_split(full_rets.index, self.v_cfg.cpcv_groups)
-        combos = list(itertools.combinations(range(self.v_cfg.cpcv_groups), self.v_cfg.cpcv_test_groups))
+        n = len(full_rets)
         
+        if self.v_cfg.use_sample_weights:
+            weights = AFMLTools.compute_sample_weights(full_rets)
+        else:
+            weights = pd.Series(1.0, index=full_rets.index)
+        
+        combos = list(itertools.combinations(range(self.v_cfg.cpcv_groups), self.v_cfg.cpcv_test_groups))
         sharpes = []
-        for grp_idxs in combos:
-            test_path = []
-            for g_id in grp_idxs:
-                idx_range = groups[g_id]
-                if idx_range[0] != full_rets.index[0]:
-                    if len(idx_range) > self.v_cfg.purge_days:
-                        idx_range = idx_range[self.v_cfg.purge_days:]
-                    else:
-                        continue
-                test_path.append(full_rets.loc[idx_range])
+        
+        for combo in combos:
+            train_idx, test_idx = AFMLTools.get_train_test_indices(
+                self.v_cfg.cpcv_groups, list(combo), n
+            )
             
-            if test_path:
-                combo_ret = pd.concat(test_path)
-                if len(combo_ret) > 100:
-                    m = combo_ret.mean() * 252
-                    s = combo_ret.std() * np.sqrt(252)
-                    sharpes.append((m - self.g_cfg.risk_free_rate)/s if s > 0 else 0)
+            train_idx, test_idx = AFMLTools.apply_purge_embargo(
+                train_idx, test_idx, 
+                self.v_cfg.purge_days, 
+                self.v_cfg.embargo_days
+            )
+            
+            if len(test_idx) < 50:
+                continue
+            
+            test_rets = full_rets.iloc[test_idx]
+            test_weights = weights.iloc[test_idx]
+            
+            # Sharpe pondéré
+            weighted_mean = (test_rets * test_weights).sum() / test_weights.sum()
+            weighted_std = np.sqrt(((test_rets - weighted_mean)**2 * test_weights).sum() / test_weights.sum())
+            
+            annual_ret = weighted_mean * 252
+            annual_vol = weighted_std * np.sqrt(252)
+            
+            sr = (annual_ret - self.g_cfg.risk_free_rate) / annual_vol if annual_vol > 0 else 0
+            sharpes.append(sr)
         
         self.cpcv_sharpes = sharpes
+        print(f"[OK] CPCV: {len(sharpes)} folds, Sharpe moyen: {np.mean(sharpes):.2f}")
 
     def calc_psr_dsr(self) -> Tuple[float, float, float]:
         if self.oos_series is None: return 0, 0, 0
@@ -216,29 +274,31 @@ class QuantValidator:
         dd_series = eq / eq.cummax() - 1
         max_dd = dd_series.min()
 
-        # PRINT REPORT
         print("\n" + "█"*70)
-        print(f"  RÉSULTATS DE VALIDATION : {self.g_cfg.ticker} (Levier {self.s_cfg.leverage}x)")
+        print(f"  RÉSULTATS VALIDATION AFML : {self.g_cfg.ticker} (Levier {self.s_cfg.leverage}x)")
         print("█"*70)
         print(f"1. PERFORMANCE OOS (WFA {self.v_cfg.wfa_years} ans)")
-        print(f"   ► CAGR             : {cagr:.2%} (Cible > 10%)")
-        print(f"   ► Max Drawdown     : {max_dd:.2%} (Seuil < 20%)")
+        print(f"   ► CAGR             : {cagr:.2%}")
+        print(f"   ► Max Drawdown     : {max_dd:.2%}")
         print(f"   ► Sharpe Ratio     : {sr:.2f}")
         print("-" * 30)
         print(f"2. FIABILITÉ STATISTIQUE (Prado)")
-        # CORRECTION ICI: Ajout des guillemets autour de l'emoji d'alerte
         print(f"   ► PSR (Prob > 0)   : {psr:.2%} {'✅' if psr > 0.95 else '⚠️'}")
         print(f"   ► DSR (Robustesse) : {dsr:.2%} {'✅' if dsr > 0.50 else '⚠️'}")
+        print("-" * 30)
+        print(f"3. CPCV (Purge={self.v_cfg.purge_days}d, Embargo={self.v_cfg.embargo_days}d)")
+        print(f"   ► Sharpe Moyen     : {np.mean(self.cpcv_sharpes):.2f}")
+        print(f"   ► Sharpe Std       : {np.std(self.cpcv_sharpes):.2f}")
+        print(f"   ► Sample Weights   : {'Activés' if self.v_cfg.use_sample_weights else 'Désactivés'}")
         print("-" * 30)
         
         median_gain = (self.bootstrap_results['proj'][2, -1]/100) - 1
         worst_case = (self.bootstrap_results['proj'][1, -1]/100) - 1
-        print(f"3. PROJECTION 5 ANS (Monte Carlo)")
+        print(f"4. PROJECTION 5 ANS (Monte Carlo)")
         print(f"   ► Gain Médian      : +{median_gain:.2%}")
         print(f"   ► VaR 95% (Worst)  : {worst_case:.2%}")
         print("="*70)
 
-        # PLOTS
         fig = plt.figure(figsize=(18, 12))
         
         ax1 = plt.subplot(2, 2, 1)
@@ -251,7 +311,7 @@ class QuantValidator:
         ax2 = plt.subplot(2, 2, 2)
         ax2.hist(self.cpcv_sharpes, bins=20, color='#F39C12', edgecolor='black', alpha=0.7)
         ax2.axvline(np.mean(self.cpcv_sharpes), color='red', ls='--', label=f'Moy: {np.mean(self.cpcv_sharpes):.2f}')
-        ax2.set_title("2. Stabilité Sharpe (CPCV)", fontweight='bold')
+        ax2.set_title("2. Stabilité Sharpe (CPCV AFML)", fontweight='bold')
         ax2.legend()
 
         ax3 = plt.subplot(2, 2, 3)
@@ -275,10 +335,6 @@ class QuantValidator:
 
         plt.tight_layout()
         plt.show()
-
-# ==========================================
-# 4. EXÉCUTION
-# ==========================================
 
 if __name__ == "__main__":
     g_conf = GlobalConfig()
